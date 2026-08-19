@@ -266,6 +266,53 @@
     min-height:16px;
     font-style:italic;
   }
+
+  .lang-row{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    flex-wrap:wrap;
+    margin-bottom:4px;
+  }
+  .lang-label{
+    font-size:12.5px;
+    color:var(--text-dim);
+    margin-right:2px;
+  }
+  .lang-pill{
+    background:var(--surface-2);
+    color:var(--text-dim);
+    border:1px solid var(--border);
+    padding:6px 13px;
+    border-radius:999px;
+    font-size:13px;
+    font-weight:600;
+  }
+  .lang-pill.active{
+    background:var(--accent-soft);
+    color:var(--accent-strong);
+    border-color:rgba(143,179,154,0.5);
+  }
+
+  .match-question{
+    font-size:12.5px;
+    color:var(--text-dim);
+    font-style:italic;
+    margin:0 0 10px;
+  }
+  .match-loading{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    color:var(--text-dim);
+    font-size:14px;
+  }
+  .dot-spin{
+    width:8px;height:8px;border-radius:50%;
+    background:var(--accent-strong);
+    animation:pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse{ 0%,100%{opacity:0.3;} 50%{opacity:1;} }
 </style>
 </head>
 <body>
@@ -278,6 +325,12 @@
   </header>
 
   <div id="supportWarning"></div>
+
+  <div class="lang-row">
+    <span class="lang-label">Listening language:</span>
+    <button class="lang-pill active" id="langEn" data-lang="en-US">English</button>
+    <button class="lang-pill" id="langNl" data-lang="nl-NL">Nederlands</button>
+  </div>
 
   <div class="listen-card">
     <div class="ring" id="ring"></div>
@@ -298,7 +351,7 @@
   <div class="match-zone" id="matchZone"></div>
 
   <div class="privacy">
-    Speech is processed live in your browser only to check against your own notes below. Nothing is saved, uploaded, or stored — the moment you stop listening, it's gone. Your notes themselves are saved privately on this device/account so they're here next time.
+    Speech is transcribed live in your browser. Most of it goes nowhere — but when what's said matches one of your topics below, that question plus the matching note are sent to Anthropic's API to work out the short answer, then discarded (not stored by this app). Nothing is sent unless there's a topic match. Your notes themselves are saved privately to your account so they're here next time.
   </div>
 
   <p class="section-title">Your topics</p>
@@ -342,7 +395,12 @@
     tkeywords: document.getElementById('tkeywords'),
     tnotes: document.getElementById('tnotes'),
     saveTopicBtn: document.getElementById('saveTopicBtn'),
+    langEn: document.getElementById('langEn'),
+    langNl: document.getElementById('langNl'),
   };
+
+  let currentLang = 'en-US';
+  let lastHandledText = '';
 
   const seedTopics = [
     {
@@ -428,28 +486,108 @@
     els.tnotes.value='';
   });
 
-  function showMatch(topic){
-    clearTimeout(matchTimeout);
-    els.matchZone.innerHTML = `
-      <div class="match-card">
-        <p class="match-topic">${escapeHtml(topic.title)}</p>
-        <p class="match-body">${escapeHtml(topic.notes)}</p>
-      </div>
-    `;
-    matchTimeout = setTimeout(()=>{
-      els.matchZone.innerHTML = '';
-    }, 25000);
-  }
-
-  function checkForMatch(text){
+  function findMatchingTopic(text){
     const lower = text.toLowerCase();
     for(const t of topics){
       const words = t.keywords.split(',').map(w=>w.trim().toLowerCase()).filter(Boolean);
       if(words.some(w => w && lower.includes(w))){
-        showMatch(t);
-        return;
+        return t;
       }
     }
+    return null;
+  }
+
+  function showLoading(topic, question){
+    clearTimeout(matchTimeout);
+    els.matchZone.innerHTML = `
+      <div class="match-card">
+        <p class="match-topic">${escapeHtml(topic.title)}</p>
+        <p class="match-question">"${escapeHtml(question)}"</p>
+        <div class="match-loading"><span class="dot-spin"></span> finding the answer in your notes…</div>
+      </div>
+    `;
+  }
+
+  function showAnswer(topic, question, answer){
+    clearTimeout(matchTimeout);
+    els.matchZone.innerHTML = `
+      <div class="match-card">
+        <p class="match-topic">${escapeHtml(topic.title)}</p>
+        <p class="match-question">"${escapeHtml(question)}"</p>
+        <p class="match-body">${escapeHtml(answer)}</p>
+      </div>
+    `;
+    matchTimeout = setTimeout(()=>{
+      els.matchZone.innerHTML = '';
+    }, 30000);
+  }
+
+  // Uses the built-in AI call (no key needed) to pull the specific, short
+  // answer out of the user's own notes for whatever was just asked.
+  async function askAI(question, notes, lang){
+    const langInstruction = lang === 'nl-NL'
+      ? 'Answer in Dutch, in plain simple everyday Dutch, no jargon.'
+      : 'Answer in English, in plain simple everyday language, no jargon.';
+
+    const prompt = `You are answering a spoken question using ONLY the notes below, which the person wrote themselves. ${langInstruction}
+Give ONLY the specific short answer to the question — one short sentence, no restating the question, no extra context, no preamble like "According to your notes". If the notes genuinely don't contain the answer, reply with exactly: NOT_IN_NOTES
+
+NOTES:
+"""
+${notes}
+"""
+
+QUESTION: ${question}
+
+SHORT ANSWER:`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+
+    if(!response.ok){
+      throw new Error('AI request failed: ' + response.status);
+    }
+    const data = await response.json();
+    const textBlock = (data.content || []).find(b => b.type === 'text');
+    return textBlock ? textBlock.text.trim() : '';
+  }
+
+  async function checkForMatch(text){
+    const trimmed = text.trim();
+    if(!trimmed || trimmed === lastHandledText) return;
+
+    const topic = findMatchingTopic(trimmed);
+    if(!topic) return;
+
+    lastHandledText = trimmed;
+    showLoading(topic, trimmed);
+
+    try{
+      const answer = await askAI(trimmed, topic.notes, currentLang);
+      if(answer === 'NOT_IN_NOTES' || !answer){
+        showAnswer(topic, trimmed, currentLang === 'nl-NL'
+          ? "Dat staat niet in je notities over dit onderwerp."
+          : "That's not covered in your notes on this topic.");
+      } else {
+        showAnswer(topic, trimmed, answer);
+      }
+    }catch(e){
+      showDebug('Couldn\'t reach the AI to answer that (' + (e && e.message ? e.message : e) + '). Showing your full notes instead.');
+      showAnswer(topic, trimmed, topic.notes);
+    }
+  }
+
+  function showDebug(msg){
+    document.getElementById('debugZone').innerHTML = msg
+      ? `<div class="support-warning">${escapeHtml(msg)}</div>`
+      : '';
   }
 
   // --- Speech recognition setup ---
@@ -467,7 +605,7 @@
     recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = 'en-US';
+    recognition.lang = currentLang;
 
     recognition.onresult = (event) => {
       let interim = '';
@@ -507,12 +645,6 @@
         try{ recognition.start(); }catch(e){}
       }
     };
-  }
-
-  function showDebug(msg){
-    document.getElementById('debugZone').innerHTML = msg
-      ? `<div class="support-warning">${escapeHtml(msg)}</div>`
-      : '';
   }
 
   async function startListening(){
@@ -561,6 +693,20 @@
   els.toggleBtn.addEventListener('click', ()=>{
     if(listening){ stopListening(); } else { startListening(); }
   });
+
+  function setLang(lang, btn){
+    currentLang = lang;
+    if(recognition) recognition.lang = lang;
+    els.langEn.classList.toggle('active', lang === 'en-US');
+    els.langNl.classList.toggle('active', lang === 'nl-NL');
+    if(listening){
+      // restart so the new language actually takes effect
+      stopListening();
+      startListening();
+    }
+  }
+  els.langEn.addEventListener('click', ()=> setLang('en-US'));
+  els.langNl.addEventListener('click', ()=> setLang('nl-NL'));
 
   loadTopics();
 })();
