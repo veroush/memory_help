@@ -488,6 +488,52 @@ env.allowLocalModels = false;
     els.tnotes.value='';
   });
 
+  const STOPWORDS = new Set([
+    // English function words
+    'the','a','an','is','are','was','were','what','when','where','how','why',
+    'does','do','did','happen','happens','happened','if','and','or','to','of',
+    'in','on','for','with','can','you','tell','me','about','it','its',"it's",
+    'this','that','these','those','be','been','being','will','would','could',
+    'should','not','no','yes','so','but','as','at','by','from','than','then',
+    // Dutch function words
+    'de','het','een','is','zijn','was','waren','wat','wanneer','waar','hoe',
+    'waarom','gebeurt','gebeurde','als','en','of','naar','van','in','op','voor',
+    'met','kan','kun','je','jij','u','vertel','over','dit','dat','deze','die',
+    'zal','zou','kunnen','moet','niet','geen','maar','dan'
+  ]);
+
+  function tokenize(str){
+    return str.toLowerCase()
+      .replace(/[.,!?;:"'()\-]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w && !STOPWORDS.has(w));
+  }
+
+  // Fully offline fallback: scores each sentence in the notes by how many
+  // meaningful words it shares with the question, returns the best match.
+  function extractLocalAnswer(question, notes){
+    const qWords = new Set(tokenize(question));
+    if(qWords.size === 0) return notes;
+
+    const sentences = notes.split(/(?<=[.!?])\s+/).map(s=>s.trim()).filter(Boolean);
+    if(sentences.length <= 1) return notes;
+
+    let best = null;
+    let bestScore = 0;
+    for(const s of sentences){
+      const sWords = tokenize(s);
+      let score = 0;
+      for(const w of sWords){ if(qWords.has(w)) score++; }
+      if(score > bestScore){
+        bestScore = score;
+        best = s;
+      }
+    }
+    // Require at least 2 overlapping meaningful words to trust a single-sentence
+    // answer — otherwise it's likely a broad question, so return everything.
+    return (best && bestScore >= 2) ? best : notes;
+  }
+
   function findMatchingTopic(text){
     const lower = text.toLowerCase();
     for(const t of topics){
@@ -574,15 +620,15 @@ SHORT ANSWER:`;
     try{
       const answer = await askAI(trimmed, topic.notes, currentLang);
       if(answer === 'NOT_IN_NOTES' || !answer){
-        showAnswer(topic, trimmed, currentLang === 'nl-NL'
-          ? "Dat staat niet in je notities over dit onderwerp."
-          : "That's not covered in your notes on this topic.");
+        showAnswer(topic, trimmed, extractLocalAnswer(trimmed, topic.notes));
       } else {
         showAnswer(topic, trimmed, answer);
       }
     }catch(e){
-      showDebug('Couldn\'t reach the AI to answer that (' + (e && e.message ? e.message : e) + '). Showing your full notes instead.');
-      showAnswer(topic, trimmed, topic.notes);
+      // The hosted AI shortcut only works inside Claude's own preview.
+      // Outside it, fall back to fully offline local matching — no error shown,
+      // since this is the expected, normal path once self-hosted.
+      showAnswer(topic, trimmed, extractLocalAnswer(trimmed, topic.notes));
     }
   }
 
@@ -614,10 +660,24 @@ SHORT ANSWER:`;
 
   function getTranscriber(onProgress){
     if(!transcriberPromise){
-      transcriberPromise = pipeline('automatic-speech-recognition', 'Xenova/whisper-base', {
-        quantized: true,
-        progress_callback: onProgress
-      });
+      transcriberPromise = (async () => {
+        // Try GPU acceleration first (much faster where supported), fall back to CPU.
+        if(navigator.gpu){
+          try{
+            return await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
+              quantized: true,
+              device: 'webgpu',
+              progress_callback: onProgress
+            });
+          }catch(e){
+            console.warn('WebGPU pipeline failed, falling back to CPU:', e);
+          }
+        }
+        return await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
+          quantized: true,
+          progress_callback: onProgress
+        });
+      })();
     }
     return transcriberPromise;
   }
@@ -652,7 +712,7 @@ SHORT ANSWER:`;
   }
 
   async function recordingLoop(){
-    const CHUNK_MS = 4000;
+    const CHUNK_MS = 3500;
     while(listening){
       try{
         const blob = await recordChunk(mediaStream, CHUNK_MS);
@@ -664,7 +724,7 @@ SHORT ANSWER:`;
         // skip near-silent chunks so we're not transcribing dead air
         let peak = 0;
         for(let i=0;i<pcm.length;i+=50){ const v=Math.abs(pcm[i]); if(v>peak) peak=v; }
-        if(peak < 0.01) continue;
+        if(peak < 0.003) continue;
 
         els.liveCaption.textContent = 'transcribing…';
         const transcriber = await getTranscriber();
