@@ -351,7 +351,7 @@
   <div class="match-zone" id="matchZone"></div>
 
   <div class="privacy">
-    Speech is transcribed live in your browser. Most of it goes nowhere — but when what's said matches one of your topics below, that question plus the matching note are sent to Anthropic's API to work out the short answer, then discarded (not stored by this app). Nothing is sent unless there's a topic match. Your notes themselves are saved privately to your account so they're here next time.
+    Speech is transcribed entirely on your phone using a local AI model — your voice never leaves the device. Only when what's said matches one of your topics below does that question + the matching note get sent to Anthropic's API to work out the short answer, then discarded. Your notes themselves are saved privately to your account.
   </div>
 
   <p class="section-title">Your topics</p>
@@ -374,12 +374,14 @@
 
 </div>
 
-<script>
+<script type="module">
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+env.allowLocalModels = false;
+
 (function(){
   const STORAGE_KEY = 'sidenote:topics';
   let topics = [];
   let listening = false;
-  let recognition = null;
   let matchTimeout = null;
 
   const els = {
@@ -590,97 +592,139 @@ SHORT ANSWER:`;
       : '';
   }
 
-  // --- Speech recognition setup ---
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  // --- Whisper-based transcription setup ---
+  const hasRecordingSupport = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 
-  if(!SpeechRecognition){
+  if(!hasRecordingSupport){
     els.supportWarning.innerHTML = `
       <div class="support-warning">
-        Live listening isn't supported in this browser. It generally works in Chrome on Android or desktop. On iPhone/Safari it likely won't work — you can still browse and add notes manually below, and open this page in Chrome on Android to try live listening.
+        This browser doesn't support microphone recording. Try Chrome on Android, or open this page directly (not inside an app's built-in preview).
       </div>
     `;
     els.toggleBtn.disabled = true;
     els.toggleBtn.style.opacity = '0.4';
-  } else {
-    recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = currentLang;
+  }
 
-    recognition.onresult = (event) => {
-      let interim = '';
-      let final = '';
-      for(let i = event.resultIndex; i < event.results.length; i++){
-        const transcript = event.results[i][0].transcript;
-        if(event.results[i].isFinal){
-          final += transcript + ' ';
-        } else {
-          interim += transcript;
-        }
-      }
-      const shown = (final + interim).trim();
-      els.liveCaption.textContent = shown ? ('“' + shown.slice(-90) + '”') : '';
-      if(final){
-        checkForMatch(final);
-      } else if(interim){
-        checkForMatch(interim);
-      }
-    };
+  let mediaStream = null;
+  let transcriberPromise = null;
 
-    recognition.onerror = (e) => {
-      if(e.error === 'not-allowed' || e.error === 'permission-denied'){
-        els.listenState.textContent = 'Microphone permission denied';
-        showDebug('Microphone permission denied by the browser. Try opening this page directly in Chrome rather than inside Claude\'s preview.');
-        stopListening();
-      } else if(e.error === 'no-speech'){
-        // benign — just silence, keep going
-      } else {
-        showDebug('Speech recognition error: ' + e.error);
-      }
-    };
+  function whisperLangName(lang){
+    return lang === 'nl-NL' ? 'dutch' : 'english';
+  }
 
-    recognition.onend = () => {
-      if(listening){
-        // browser auto-stopped (e.g. silence) — restart to keep it continuous
-        try{ recognition.start(); }catch(e){}
+  function getTranscriber(onProgress){
+    if(!transcriberPromise){
+      transcriberPromise = pipeline('automatic-speech-recognition', 'Xenova/whisper-base', {
+        quantized: true,
+        progress_callback: onProgress
+      });
+    }
+    return transcriberPromise;
+  }
+
+  async function decodeToPCM16k(blob){
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+    const targetRate = 16000;
+    const offlineCtx = new OfflineAudioContext(1, Math.ceil(decoded.duration * targetRate), targetRate);
+    const source = offlineCtx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offlineCtx.destination);
+    source.start(0);
+    const rendered = await offlineCtx.startRendering();
+    audioCtx.close();
+    return rendered.getChannelData(0);
+  }
+
+  function recordChunk(stream, durationMs){
+    return new Promise((resolve, reject)=>{
+      let recorder;
+      try{ recorder = new MediaRecorder(stream); }
+      catch(e){ reject(e); return; }
+      const chunks = [];
+      recorder.ondataavailable = (e)=>{ if(e.data && e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = ()=> resolve(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }));
+      recorder.onerror = (e)=> reject(e.error || e);
+      recorder.start();
+      setTimeout(()=>{ try{ recorder.stop(); }catch(e){ reject(e); } }, durationMs);
+    });
+  }
+
+  async function recordingLoop(){
+    const CHUNK_MS = 4000;
+    while(listening){
+      try{
+        const blob = await recordChunk(mediaStream, CHUNK_MS);
+        if(!listening) break;
+
+        const pcm = await decodeToPCM16k(blob);
+        if(!listening) break;
+
+        // skip near-silent chunks so we're not transcribing dead air
+        let peak = 0;
+        for(let i=0;i<pcm.length;i+=50){ const v=Math.abs(pcm[i]); if(v>peak) peak=v; }
+        if(peak < 0.01) continue;
+
+        els.liveCaption.textContent = 'transcribing…';
+        const transcriber = await getTranscriber();
+        const result = await transcriber(pcm, {
+          language: whisperLangName(currentLang),
+          task: 'transcribe',
+          chunk_length_s: 30
+        });
+        const text = (result && result.text ? result.text : '').trim();
+        els.liveCaption.textContent = text ? ('“' + text + '”') : '';
+        if(text){ checkForMatch(text); }
+      }catch(e){
+        showDebug('Transcription hiccup: ' + (e && e.message ? e.message : e) + ' — still listening.');
+        await new Promise(r=>setTimeout(r, 800));
       }
-    };
+    }
   }
 
   async function startListening(){
-    if(!recognition) return;
+    if(!hasRecordingSupport) return;
     showDebug('');
 
-    // Explicitly request mic permission first so we get a real, visible error
-    // instead of SpeechRecognition failing silently.
     try{
-      if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach(t => t.stop()); // we only needed the permission prompt
-      }
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     }catch(permErr){
-      showDebug('Microphone permission was blocked or denied (' + (permErr && permErr.name ? permErr.name : 'unknown error') + '). If you\'re in Claude\'s in-chat preview, open this page in your phone\'s browser directly (tap the file → open externally) and try again — the in-chat preview often can\'t grant microphone access at all.');
+      showDebug('Microphone permission was blocked or denied (' + (permErr && permErr.name ? permErr.name : 'unknown error') + '). If you\'re in Claude\'s in-chat preview, open this page directly in your phone\'s browser instead — tap the file → open externally.');
       return;
     }
 
+    listening = true;
+    els.ring.classList.add('live');
+    els.toggleBtn.textContent = 'Stop';
+    els.toggleBtn.classList.add('stop');
+    els.listenTitle.textContent = 'Loading speech model…';
+    els.listenState.textContent = 'First time only — downloading, needs decent wifi';
+
     try{
-      recognition.start();
-      listening = true;
-      els.ring.classList.add('live');
-      els.listenTitle.textContent = 'Listening';
-      els.listenState.textContent = 'Watching for topics you\'ve saved below';
-      els.toggleBtn.textContent = 'Stop';
-      els.toggleBtn.classList.add('stop');
+      await getTranscriber((progress)=>{
+        if(progress && progress.status === 'progress' && typeof progress.progress === 'number'){
+          els.listenState.textContent = 'Downloading model… ' + Math.round(progress.progress) + '%';
+        }
+      });
     }catch(e){
-      showDebug('Couldn\'t start listening: ' + (e && e.message ? e.message : e));
-      console.error(e);
+      showDebug('Could not load the speech model: ' + (e && e.message ? e.message : e));
+      stopListening();
+      return;
     }
+
+    if(!listening) return; // stopped while model was loading
+
+    els.listenTitle.textContent = 'Listening';
+    els.listenState.textContent = 'Picks up speech every few seconds';
+    recordingLoop();
   }
 
   function stopListening(){
     listening = false;
-    if(recognition){
-      try{ recognition.stop(); }catch(e){}
+    if(mediaStream){
+      mediaStream.getTracks().forEach(t=>t.stop());
+      mediaStream = null;
     }
     els.ring.classList.remove('live');
     els.listenTitle.textContent = 'Not listening';
@@ -694,16 +738,10 @@ SHORT ANSWER:`;
     if(listening){ stopListening(); } else { startListening(); }
   });
 
-  function setLang(lang, btn){
+  function setLang(lang){
     currentLang = lang;
-    if(recognition) recognition.lang = lang;
     els.langEn.classList.toggle('active', lang === 'en-US');
     els.langNl.classList.toggle('active', lang === 'nl-NL');
-    if(listening){
-      // restart so the new language actually takes effect
-      stopListening();
-      startListening();
-    }
   }
   els.langEn.addEventListener('click', ()=> setLang('en-US'));
   els.langNl.addEventListener('click', ()=> setLang('nl-NL'));
